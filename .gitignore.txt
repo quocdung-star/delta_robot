@@ -1,0 +1,8 @@
+# Các file tạm của PlatformIO
+.pio/
+.vscode/
+
+# Các file thực thi (không cần thiết đưa lên mạng)
+*.bin
+*.elf
+*.hex
