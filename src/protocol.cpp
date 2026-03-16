@@ -2,25 +2,13 @@
 #include "protocol.h"
 #include "axis.h"
 #include "homing.h"
+#include "limit_switch.h"
 #include "motion.h"
 #include "app_pins.h"
 #include "stepper.h"
 
 static void parse_command(String cmd);
 static void serial_task(void *pv);
-
-// Helper functions to read limit switches directly using app_pins.h
-static bool limit_x_triggered() {
-    return digitalRead(LIMIT_X) == ENDSTOP_TRIGGERED;
-}
-
-static bool limit_y_triggered() {
-    return digitalRead(LIMIT_Y) == ENDSTOP_TRIGGERED;
-}
-
-static bool limit_z_triggered() {
-    return digitalRead(LIMIT_Z) == ENDSTOP_TRIGGERED;
-}
 
 void protocol_init() {
     Serial.begin(115200);
@@ -30,9 +18,7 @@ void protocol_init() {
     pinMode(CLOCK_PIN, OUTPUT);
     pinMode(LATCH_PIN, OUTPUT);
 
-    pinMode(LIMIT_X, INPUT);
-    pinMode(LIMIT_Y, INPUT);
-    pinMode(LIMIT_Z, INPUT);
+    limit_switch_init();
 
     axis_init();
     stepper_init();
@@ -72,15 +58,15 @@ static void parse_command(String cmd) {
 
     if (cmd == "$HX") {
         Serial.println("Homing X");
-        bool ok = home_axis(axisX, LIMIT_X);
+        bool ok = home_axis(axisX, limit_x_triggered);
         Serial.println(ok ? "HX_DONE" : "HX_FAIL");
     } else if (cmd == "$HY") {
         Serial.println("Homing Y");
-        bool ok = home_axis(axisY, LIMIT_Y);
+        bool ok = home_axis(axisY, limit_y_triggered);
         Serial.println(ok ? "HY_DONE" : "HY_FAIL");
     } else if (cmd == "$HZ") {
         Serial.println("Homing Z");
-        bool ok = home_axis(axisZ, LIMIT_Z);
+        bool ok = home_axis(axisZ, limit_z_triggered);
         Serial.println(ok ? "HZ_DONE" : "HZ_FAIL");
     } else if (cmd == "$LX") {
         Serial.print("LIMIT_X: ");
