@@ -20,6 +20,20 @@ void stepper_step_axis(Axis &axis) {
     delayMicroseconds(speed_control_get_step_delay_us());
 }
 
+void stepper_step_active_axes() {
+    axisX.step = axisX.moving;
+    axisY.step = axisY.moving;
+    axisZ.step = axisZ.moving;
+    shift595_write(shift595_build_output());
+    delayMicroseconds(speed_control_get_step_delay_us());
+
+    axisX.step = false;
+    axisY.step = false;
+    axisZ.step = false;
+    shift595_write(shift595_build_output());
+    delayMicroseconds(speed_control_get_step_delay_us());
+}
+
 bool stepper_move_axis(Axis &axis, bool dir, long steps) {
     if (steps <= 0) {
         axis.moving = false;

@@ -50,10 +50,97 @@ bool home_axis(Axis &axis, LimitSwitchReadFn isTriggered) {
 
 HomingReport homing_run() {
     HomingReport report = {};
+    bool xFailed = false;
+    bool yFailed = false;
+    bool zFailed = false;
+    long xSteps = 0;
+    long ySteps = 0;
+    long zSteps = 0;
+    const unsigned long startMs = millis();
 
-    report.xHomed = home_axis(axisX, limit_x_triggered);
-    report.yHomed = home_axis(axisY, limit_y_triggered);
-    report.zHomed = home_axis(axisZ, limit_z_triggered);
+    axisX.dir = true;
+    axisY.dir = true;
+    axisZ.dir = true;
+
+    report.xHomed = limit_x_triggered();
+    report.yHomed = limit_y_triggered();
+    report.zHomed = limit_z_triggered();
+
+    axisX.moving = !report.xHomed;
+    axisY.moving = !report.yHomed;
+    axisZ.moving = !report.zHomed;
+
+    while (axisX.moving || axisY.moving || axisZ.moving) {
+        emergency_stop_poll();
+
+        if (emergency_stop_is_active()) {
+            break;
+        }
+
+        stepper_step_active_axes();
+
+        if (axisX.moving) {
+            xSteps++;
+        }
+        if (axisY.moving) {
+            ySteps++;
+        }
+        if (axisZ.moving) {
+            zSteps++;
+        }
+
+        report.xHomed = limit_x_triggered();
+        report.yHomed = limit_y_triggered();
+        report.zHomed = limit_z_triggered();
+
+        if (report.xHomed) {
+            axisX.moving = false;
+        }
+        if (report.yHomed) {
+            axisY.moving = false;
+        }
+        if (report.zHomed) {
+            axisZ.moving = false;
+        }
+
+        if ((millis() - startMs) > HOMING_TIMEOUT_MS) {
+            xFailed = !report.xHomed;
+            yFailed = !report.yHomed;
+            zFailed = !report.zHomed;
+            break;
+        }
+
+        if (xSteps > HOMING_MAX_STEPS) {
+            xFailed = true;
+            axisX.moving = false;
+        }
+        if (ySteps > HOMING_MAX_STEPS) {
+            yFailed = true;
+            axisY.moving = false;
+        }
+        if (zSteps > HOMING_MAX_STEPS) {
+            zFailed = true;
+            axisZ.moving = false;
+        }
+    }
+
+    axisX.moving = false;
+    axisY.moving = false;
+    axisZ.moving = false;
+    axisX.stepsRemaining = 0;
+    axisY.stepsRemaining = 0;
+    axisZ.stepsRemaining = 0;
+
+    if (emergency_stop_is_active()) {
+        report.xHomed = false;
+        report.yHomed = false;
+        report.zHomed = false;
+    } else {
+        report.xHomed = report.xHomed && !xFailed;
+        report.yHomed = report.yHomed && !yFailed;
+        report.zHomed = report.zHomed && !zFailed;
+    }
+
     report.allHomed = report.xHomed && report.yHomed && report.zHomed;
 
     return report;
