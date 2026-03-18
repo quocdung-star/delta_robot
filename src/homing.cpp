@@ -6,7 +6,7 @@
 #include "stepper.h"
 
 bool home_axis(Axis &axis, LimitSwitchReadFn isTriggered) {
-    axis.dir = true; // homing direction, adjust if needed
+    axis.dir = false; // homing direction set to LOW
 
     // If already triggered, consider homed (or wiring inverted)
     if (isTriggered()) {
@@ -58,9 +58,9 @@ HomingReport homing_run() {
     long zSteps = 0;
     const unsigned long startMs = millis();
 
-    axisX.dir = true;
-    axisY.dir = true;
-    axisZ.dir = true;
+    axisX.dir = false;
+    axisY.dir = false;
+    axisZ.dir = false;
 
     report.xHomed = limit_x_triggered();
     report.yHomed = limit_y_triggered();

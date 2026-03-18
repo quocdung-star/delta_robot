@@ -34,11 +34,17 @@ void stepper_step_active_axes() {
     delayMicroseconds(speed_control_get_step_delay_us());
 }
 
-bool stepper_move_axis(Axis &axis, bool dir, long steps) {
+bool stepper_move_axis(Axis &axis, bool dir, long steps, LimitSwitchReadFn homeSwitchTriggered) {
     if (steps <= 0) {
         axis.moving = false;
         axis.stepsRemaining = 0;
         return true;
+    }
+
+    if (!dir && homeSwitchTriggered != nullptr && homeSwitchTriggered()) {
+        axis.moving = false;
+        axis.stepsRemaining = 0;
+        return false;
     }
 
     axis.dir = dir;
@@ -49,6 +55,12 @@ bool stepper_move_axis(Axis &axis, bool dir, long steps) {
         emergency_stop_poll();
 
         if (emergency_stop_is_active()) {
+            axis.moving = false;
+            axis.stepsRemaining = 0;
+            return false;
+        }
+
+        if (!dir && homeSwitchTriggered != nullptr && homeSwitchTriggered()) {
             axis.moving = false;
             axis.stepsRemaining = 0;
             return false;

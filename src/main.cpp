@@ -6,6 +6,7 @@
 #include "axis.h"
 #include "emergency_stop.h"
 #include "homing.h"
+#include "limit_switch.h"
 #include "limit_switch_monitor.h"
 #include "speed_control.h"
 #include "stepper.h"
@@ -27,7 +28,32 @@ static void print_homing_status(const HomingReport &report) {
 static void print_input_prompt() {
     Serial.println("Enter angles as: X Y Z");
     Serial.println("Positive angle -> HIGH direction, negative angle -> LOW direction");
-    Serial.println("Use $V <delay_us> to change speed, use $S for emergency stop");
+    Serial.println("Use $H to start homing, $V <rpm> to change speed, use $S for emergency stop");
+}
+
+static void print_waiting_home_prompt() {
+    Serial.println("Waiting for homing command.");
+    Serial.println("Use $H to start homing, $V <rpm> to change speed, use $S for emergency stop");
+}
+
+static void run_homing_command() {
+    if (emergency_stop_is_active()) {
+        Serial.println("Emergency stop is active. Clear stop state before homing.");
+        return;
+    }
+
+    Serial.println("Starting homing...");
+    const HomingReport report = homing_run();
+    print_homing_status(report);
+    homingCompleted = report.allHomed;
+
+    if (homingCompleted) {
+        Serial.println("Homing complete. Angle input unlocked.");
+        print_input_prompt();
+    } else {
+        Serial.println("Homing failed. Angle input locked.");
+        print_waiting_home_prompt();
+    }
 }
 
 static long angle_to_steps(float angleDeg) {
@@ -35,7 +61,7 @@ static long angle_to_steps(float angleDeg) {
     return (long)(steps + 0.5f);
 }
 
-static bool move_axis_from_angle(const char *axisName, Axis &axis, float angleDeg) {
+static bool move_axis_from_angle(const char *axisName, Axis &axis, float angleDeg, LimitSwitchReadFn homeSwitchTriggered) {
     const bool dirHigh = angleDeg >= 0.0f;
     const long steps = angle_to_steps(angleDeg);
 
@@ -51,7 +77,13 @@ static bool move_axis_from_angle(const char *axisName, Axis &axis, float angleDe
         return true;
     }
 
-    return stepper_move_axis(axis, dirHigh, steps);
+    if (!dirHigh && homeSwitchTriggered != nullptr && homeSwitchTriggered()) {
+        Serial.print(axisName);
+        Serial.println(": move blocked because home limit is already active.");
+        return false;
+    }
+
+    return stepper_move_axis(axis, dirHigh, steps, homeSwitchTriggered);
 }
 
 static void handle_angle_command(const String &command) {
@@ -73,9 +105,9 @@ static void handle_angle_command(const String &command) {
         return;
     }
 
-    const bool xOk = move_axis_from_angle("X", axisX, angleX);
-    const bool yOk = xOk ? move_axis_from_angle("Y", axisY, angleY) : false;
-    const bool zOk = yOk ? move_axis_from_angle("Z", axisZ, angleZ) : false;
+    const bool xOk = move_axis_from_angle("X", axisX, angleX, limit_x_triggered);
+    const bool yOk = xOk ? move_axis_from_angle("Y", axisY, angleY, limit_y_triggered) : false;
+    const bool zOk = yOk ? move_axis_from_angle("Z", axisZ, angleZ, limit_z_triggered) : false;
 
     if (xOk && yOk && zOk) {
         Serial.println("MOVE_DONE");
@@ -87,15 +119,17 @@ static void handle_angle_command(const String &command) {
 }
 
 static void handle_speed_command(const String &command) {
-    unsigned long delayUs = 0;
+    float rpm = 0.0f;
 
-    if (sscanf(command.c_str(), "$V %lu", &delayUs) != 1) {
-        Serial.println("Invalid speed command. Use: $V <delay_us>");
+    if (sscanf(command.c_str(), "$V %f", &rpm) != 1 || rpm <= 0.0f) {
+        Serial.println("Invalid speed command. Use: $V <rpm>");
         return;
     }
 
-    speed_control_set_step_delay_us(delayUs);
-    Serial.print("STEP_DELAY_US set to ");
+    speed_control_set_rpm(rpm);
+    Serial.print("RPM set to ");
+    Serial.println(speed_control_get_rpm(), 3);
+    Serial.print("STEP_DELAY_US = ");
     Serial.println(speed_control_get_step_delay_us());
 }
 
@@ -106,9 +140,24 @@ static void handle_serial_command(const String &command) {
         return;
     }
 
+    if (command == "$H") {
+        run_homing_command();
+        return;
+    }
+
     if (command.startsWith("$V ")) {
         handle_speed_command(command);
-        print_input_prompt();
+        if (homingCompleted) {
+            print_input_prompt();
+        } else {
+            print_waiting_home_prompt();
+        }
+        return;
+    }
+
+    if (!homingCompleted) {
+        Serial.println("Homing has not started. Use $H first.");
+        print_waiting_home_prompt();
         return;
     }
 
@@ -127,25 +176,12 @@ void setup() {
     axis_init();
     stepper_init();
 
-    Serial.println("Starting homing test...");
-    const HomingReport report = homing_run();
-    print_homing_status(report);
-    homingCompleted = report.allHomed;
-
-    if (homingCompleted) {
-        Serial.println("Homing complete. Angle input unlocked.");
-        print_input_prompt();
-    } else {
-        Serial.println("Homing failed. Angle input locked.");
-    }
+    Serial.println("System ready. Homing is manual.");
+    print_waiting_home_prompt();
 }
 
 void loop() {
     limit_switch_monitor_update();
-
-    if (!homingCompleted) {
-        return;
-    }
 
     while (Serial.available()) {
         const char c = (char) Serial.read();
