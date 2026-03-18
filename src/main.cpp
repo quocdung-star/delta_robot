@@ -1,8 +1,8 @@
 #include <Arduino.h>
-#include <math.h>
+#include <ctype.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include "app_pins.h"
-#include "app_config.h"
 #include "axis.h"
 #include "emergency_stop.h"
 #include "homing.h"
@@ -13,6 +13,16 @@
 
 static bool homingCompleted = false;
 static String serialBuffer;
+enum class MotionInputAxis : uint8_t {
+    X = 0,
+    Y,
+    Z,
+};
+
+static MotionInputAxis nextMotionInputAxis = MotionInputAxis::X;
+static long pendingXPulses = 0;
+static long pendingYPulses = 0;
+static long pendingZPulses = 0;
 
 static void print_homing_status(const HomingReport &report) {
     Serial.print("HOME_X: ");
@@ -26,9 +36,11 @@ static void print_homing_status(const HomingReport &report) {
 }
 
 static void print_input_prompt() {
-    Serial.println("Enter angles as: X Y Z");
-    Serial.println("Positive angle -> HIGH direction, negative angle -> LOW direction");
+    Serial.println("Enter pulses one axis at a time, press Enter after each value.");
+    Serial.println("Input order: X, then Y, then Z.");
+    Serial.println("Positive pulses -> HIGH direction, negative pulses -> LOW direction");
     Serial.println("Use $H to start homing, $V <rpm> to change speed, use $S for emergency stop");
+    Serial.println("Enter X pulses:");
 }
 
 static void print_waiting_home_prompt() {
@@ -56,19 +68,58 @@ static void run_homing_command() {
     }
 }
 
-static long angle_to_steps(float angleDeg) {
-    const float steps = fabsf(angleDeg) * STEPS_PER_DEGREE;
-    return (long)(steps + 0.5f);
+static void reset_motion_input() {
+    nextMotionInputAxis = MotionInputAxis::X;
+    pendingXPulses = 0;
+    pendingYPulses = 0;
+    pendingZPulses = 0;
 }
 
-static bool move_axis_from_angle(const char *axisName, Axis &axis, float angleDeg, LimitSwitchReadFn homeSwitchTriggered) {
-    const bool dirHigh = angleDeg >= 0.0f;
-    const long steps = angle_to_steps(angleDeg);
+static const char *axis_name(MotionInputAxis axis) {
+    switch (axis) {
+        case MotionInputAxis::X:
+            return "X";
+        case MotionInputAxis::Y:
+            return "Y";
+        case MotionInputAxis::Z:
+            return "Z";
+        default:
+            return "?";
+    }
+}
+
+static void print_next_axis_prompt() {
+    Serial.print("Enter ");
+    Serial.print(axis_name(nextMotionInputAxis));
+    Serial.println(" pulses:");
+}
+
+static bool parse_pulses(const String &command, long &pulses) {
+    char *endPtr = nullptr;
+    pulses = strtol(command.c_str(), &endPtr, 10);
+
+    if (endPtr == command.c_str()) {
+        return false;
+    }
+
+    while (*endPtr != '\0') {
+        if (!isspace((unsigned char) *endPtr)) {
+            return false;
+        }
+        endPtr++;
+    }
+
+    return true;
+}
+
+static bool move_axis_from_pulses(const char *axisName, Axis &axis, long pulses, LimitSwitchReadFn homeSwitchTriggered) {
+    const bool dirHigh = pulses >= 0;
+    const long steps = labs(pulses);
 
     Serial.print(axisName);
-    Serial.print(": angle=");
-    Serial.print(angleDeg, 3);
-    Serial.print(" deg, dir=");
+    Serial.print(": pulses=");
+    Serial.print(pulses);
+    Serial.print(", dir=");
     Serial.print(dirHigh ? "HIGH" : "LOW");
     Serial.print(", steps=");
     Serial.println(steps);
@@ -86,17 +137,14 @@ static bool move_axis_from_angle(const char *axisName, Axis &axis, float angleDe
     return stepper_move_axis(axis, dirHigh, steps, homeSwitchTriggered);
 }
 
-static void handle_angle_command(const String &command) {
-    float angleX = 0.0f;
-    float angleY = 0.0f;
-    float angleZ = 0.0f;
-    char buffer[96];
+static void handle_pulse_command(const String &command) {
+    long pulses = 0;
 
-    command.toCharArray(buffer, sizeof(buffer));
-
-    if (sscanf(buffer, "%f %f %f", &angleX, &angleY, &angleZ) != 3) {
-        Serial.println("Invalid input. Use format: X Y Z");
-        print_input_prompt();
+    if (!parse_pulses(command, pulses)) {
+        Serial.print("Invalid pulse input for axis ");
+        Serial.print(axis_name(nextMotionInputAxis));
+        Serial.println(". Enter an integer value.");
+        print_next_axis_prompt();
         return;
     }
 
@@ -105,9 +153,25 @@ static void handle_angle_command(const String &command) {
         return;
     }
 
-    const bool xOk = move_axis_from_angle("X", axisX, angleX, limit_x_triggered);
-    const bool yOk = xOk ? move_axis_from_angle("Y", axisY, angleY, limit_y_triggered) : false;
-    const bool zOk = yOk ? move_axis_from_angle("Z", axisZ, angleZ, limit_z_triggered) : false;
+    switch (nextMotionInputAxis) {
+        case MotionInputAxis::X:
+            pendingXPulses = pulses;
+            nextMotionInputAxis = MotionInputAxis::Y;
+            print_next_axis_prompt();
+            return;
+        case MotionInputAxis::Y:
+            pendingYPulses = pulses;
+            nextMotionInputAxis = MotionInputAxis::Z;
+            print_next_axis_prompt();
+            return;
+        case MotionInputAxis::Z:
+            pendingZPulses = pulses;
+            break;
+    }
+
+    const bool xOk = move_axis_from_pulses("X", axisX, pendingXPulses, limit_x_triggered);
+    const bool yOk = xOk ? move_axis_from_pulses("Y", axisY, pendingYPulses, limit_y_triggered) : false;
+    const bool zOk = yOk ? move_axis_from_pulses("Z", axisZ, pendingZPulses, limit_z_triggered) : false;
 
     if (xOk && yOk && zOk) {
         Serial.println("MOVE_DONE");
@@ -115,6 +179,7 @@ static void handle_angle_command(const String &command) {
         Serial.println("MOVE_ABORTED");
     }
 
+    reset_motion_input();
     print_input_prompt();
 }
 
@@ -141,6 +206,7 @@ static void handle_serial_command(const String &command) {
     }
 
     if (command == "$H") {
+        reset_motion_input();
         run_homing_command();
         return;
     }
@@ -161,7 +227,7 @@ static void handle_serial_command(const String &command) {
         return;
     }
 
-    handle_angle_command(command);
+    handle_pulse_command(command);
 }
 
 void setup() {
@@ -175,6 +241,7 @@ void setup() {
     emergency_stop_init();
     axis_init();
     stepper_init();
+    reset_motion_input();
 
     Serial.println("System ready. Homing is manual.");
     print_waiting_home_prompt();
