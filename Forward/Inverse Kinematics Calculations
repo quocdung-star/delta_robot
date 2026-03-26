@@ -1,1 +1,579 @@
+#include <Arduino.h>
+#include <math.h>
 
+/*
+  ============================================================
+  DELTA ROBOT KINEMATICS FOR MKS DLC32 V2.1 (ESP32)
+  ------------------------------------------------------------
+  Chuyển từ source JavaScript sang C/C++ để chạy trên ESP32.
+
+  Mô hình đang dùng:
+  - Rotary delta robot
+  - 3 tay trên quay bởi motor
+  - 3 nhánh cách nhau 120 độ
+  - Đầu công tác chỉ tịnh tiến theo X, Y, Z
+  - Quy ước của source gốc:
+      0 độ = tay trên (bicep) nằm ngang
+  ============================================================
+*/
+
+
+/* ============================================================
+   1) THÔNG SỐ HÌNH HỌC ROBOT
+   ------------------------------------------------------------
+   Bạn PHẢI thay các thông số này theo robot thật của bạn.
+   Đơn vị: mm
+   ============================================================ */
+const float DELTA_E  = 24.0f;   // End effector radius: từ wrist tới tool
+const float DELTA_F  = 75.0f;   // Base radius: từ tâm máy tới tâm trục motor
+const float DELTA_RE = 300.0f;  // Forearm length: từ elbow tới wrist
+const float DELTA_RF = 100.0f;  // Bicep length: từ trục motor tới elbow
+
+/* ============================================================
+   2) THÔNG SỐ ĐỘNG CƠ / STEP
+   ------------------------------------------------------------
+   Ví dụ:
+   - động cơ 1.8 độ -> 200 step/vòng
+   - microstep 1/16 -> 3200 step/vòng
+   ============================================================ */
+const float STEPS_PER_REV = 3200.0f;
+
+/* ============================================================
+   3) OFFSET / CHIỀU QUAY CHO 3 TRỤC
+   ------------------------------------------------------------
+   Dùng để hiệu chỉnh khi robot thật không trùng quy ước source.
+   Công thức:
+       theta_motor = DIR_SIGN * theta_calc + OFFSET_DEG
+   ============================================================ */
+const float OFFSET_T1_DEG = 0.0f;
+const float OFFSET_T2_DEG = 0.0f;
+const float OFFSET_T3_DEG = 0.0f;
+
+const int DIR_SIGN_T1 = 1;   // đổi thành -1 nếu motor quay ngược
+const int DIR_SIGN_T2 = 1;
+const int DIR_SIGN_T3 = 1;
+
+/* ============================================================
+   4) CHÂN STEP/DIR MẪU
+   ------------------------------------------------------------
+   Bạn phải thay theo sơ đồ chân đúng của MKS DLC32 V2.1 mà bạn đang đấu.
+   MKS DLC32 là bo ESP32-based, nạp/flash qua USB COM. :contentReference[oaicite:7]{index=7}
+
+   Ở đây mình để dạng ví dụ để bạn dễ hiểu kiến trúc code.
+   Trước khi chạy thực, hãy đối chiếu đúng pinout board của bạn.
+   ============================================================ */
+const int STEP_PIN_1 = 26;
+const int DIR_PIN_1  = 27;
+
+const int STEP_PIN_2 = 14;
+const int DIR_PIN_2  = 12;
+
+const int STEP_PIN_3 = 33;
+const int DIR_PIN_3  = 32;
+
+const int EN_PIN     = 13;   // nếu driver enable mức thấp/cao thì chỉnh lại logic
+
+/* ============================================================
+   5) CÁC HẰNG SỐ LƯỢNG GIÁC
+   ------------------------------------------------------------
+   Đây là các hằng số xuất hiện trực tiếp trong source JS.
+   ============================================================ */
+const float SQRT3  = 1.7320508075688772f;
+const float PI_F   = 3.14159265358979323846f;
+const float SIN120 = SQRT3 / 2.0f;
+const float COS120 = -0.5f;
+const float TAN60  = SQRT3;
+const float SIN30  = 0.5f;
+const float TAN30  = 1.0f / SQRT3;
+
+
+/* ============================================================
+   6) STRUCT CHỨA KẾT QUẢ FK/IK
+   ------------------------------------------------------------
+   Tránh kiểu trả Array(...) như JavaScript.
+   ============================================================ */
+struct DeltaFKResult {
+  bool ok;
+  float x;
+  float y;
+  float z;
+};
+
+struct DeltaIKResult {
+  bool ok;
+  float theta1;
+  float theta2;
+  float theta3;
+};
+
+
+/* ============================================================
+   7) HÀM TIỆN ÍCH: ĐỔI ĐỘ -> RAD
+   ============================================================ */
+float degToRad(float deg) {
+  return deg * PI_F / 180.0f;
+}
+
+/* ============================================================
+   8) HÀM TIỆN ÍCH: ĐỔI RAD -> ĐỘ
+   ============================================================ */
+float radToDeg(float rad) {
+  return rad * 180.0f / PI_F;
+}
+
+
+/* ============================================================
+   9) FORWARD KINEMATICS (FK)
+   ------------------------------------------------------------
+   Input:
+     theta1, theta2, theta3 (đơn vị độ)
+
+   Output:
+     x, y, z (đơn vị mm)
+
+   Ý tưởng:
+   - Từ 3 góc motor, tính vị trí 3 khớp khuỷu (elbow)
+   - Mỗi forearm có chiều dài re -> đầu công tác là giao của 3 mặt cầu
+   - Rút gọn về phương trình bậc hai theo z
+   ============================================================ */
+DeltaFKResult delta_calcForward(float theta1_deg, float theta2_deg, float theta3_deg) {
+  DeltaFKResult result;
+  result.ok = false;
+  result.x = 0.0f;
+  result.y = 0.0f;
+  result.z = 0.0f;
+
+  // t là độ lệch hình học giữa đế và bàn động
+  float t = (DELTA_F - DELTA_E) * TAN30 / 2.0f;
+
+  // Đổi góc sang radian để dùng sin/cos trong C++
+  float theta1 = degToRad(theta1_deg);
+  float theta2 = degToRad(theta2_deg);
+  float theta3 = degToRad(theta3_deg);
+
+  /*
+    Tính vị trí 3 elbow.
+    Nhánh 1 nằm trong mặt phẳng YZ.
+  */
+  float y1 = -(t + DELTA_RF * cos(theta1));
+  float z1 = -DELTA_RF * sin(theta1);
+
+  /*
+    Nhánh 2 quay +120 độ so với nhánh 1.
+  */
+  float y2 = (t + DELTA_RF * cos(theta2)) * SIN30;
+  float x2 = y2 * TAN60;
+  float z2 = -DELTA_RF * sin(theta2);
+
+  /*
+    Nhánh 3 quay -120 độ so với nhánh 1.
+  */
+  float y3 = (t + DELTA_RF * cos(theta3)) * SIN30;
+  float x3 = -y3 * TAN60;
+  float z3 = -DELTA_RF * sin(theta3);
+
+  /*
+    dnm là hệ số trung gian khi giải hệ giao 3 mặt cầu.
+  */
+  float dnm = (y2 - y1) * x3 - (y3 - y1) * x2;
+
+  /*
+    w1, w2, w3 là bình phương khoảng cách của 3 elbow tới gốc tọa độ.
+  */
+  float w1 = y1 * y1 + z1 * z1;
+  float w2 = x2 * x2 + y2 * y2 + z2 * z2;
+  float w3 = x3 * x3 + y3 * y3 + z3 * z3;
+
+  /*
+    Từ phép biến đổi đại số, ta rút được:
+      x = (a1*z + b1) / dnm
+      y = (a2*z + b2) / dnm
+  */
+  float a1 = (z2 - z1) * (y3 - y1) - (z3 - z1) * (y2 - y1);
+  float b1 = -((w2 - w1) * (y3 - y1) - (w3 - w1) * (y2 - y1)) / 2.0f;
+
+  float a2 = -(z2 - z1) * x3 + (z3 - z1) * x2;
+  float b2 = ((w2 - w1) * x3 - (w3 - w1) * x2) / 2.0f;
+
+  /*
+    Cuối cùng đưa về phương trình:
+      a*z^2 + b*z + c = 0
+  */
+  float a = a1 * a1 + a2 * a2 + dnm * dnm;
+  float b = 2.0f * (a1 * b1 + a2 * (b2 - y1 * dnm) - z1 * dnm * dnm);
+  float c = (b2 - y1 * dnm) * (b2 - y1 * dnm) + b1 * b1 + dnm * dnm * (z1 * z1 - DELTA_RE * DELTA_RE);
+
+  /*
+    Discriminant:
+      d = b^2 - 4ac
+    Nếu d < 0 thì không có nghiệm thực -> bộ góc này không tạo ra vị trí hợp lệ
+  */
+  float d = b * b - 4.0f * a * c;
+  if (d < 0.0f) {
+    return result;
+  }
+
+  /*
+    Chọn nghiệm z âm theo đúng source gốc.
+  */
+  float z0 = -0.5f * (b + sqrt(d)) / a;
+  float x0 = (a1 * z0 + b1) / dnm;
+  float y0 = (a2 * z0 + b2) / dnm;
+
+  result.ok = true;
+  result.x = x0;
+  result.y = y0;
+  result.z = z0;
+  return result;
+}
+
+
+/* ============================================================
+   10) HÀM PHỤ IK CHO 1 NHÁNH TRONG MẶT PHẲNG YZ
+   ------------------------------------------------------------
+   Đây là bản chuyển trực tiếp từ delta_calcAngleYZ() trong JS.
+
+   Ý tưởng:
+   - Với mỗi nhánh, đưa bài toán về mặt phẳng YZ
+   - Tìm vị trí elbow sao cho:
+       + khoảng cách từ motor shaft đến elbow = rf
+       + khoảng cách từ elbow đến wrist = re
+   - Sau đó suy ra góc motor theta
+   ============================================================ */
+bool delta_calcAngleYZ(float x0, float y0, float z0, float &theta_deg) {
+  /*
+    y1 là vị trí trục motor nhánh đang xét trên mặt phẳng YZ.
+    Source JS dùng:
+      y1 = -0.5 * 0.57735 * f
+    mà 0.57735 ≈ tan(30°)
+  */
+  float y1 = -0.5f * TAN30 * DELTA_F;
+
+  /*
+    Dịch tâm từ center của bàn động ra mép nối tay dưới.
+  */
+  y0 -= 0.5f * TAN30 * DELTA_E;
+
+  /*
+    Trong source, bài toán được đưa về dạng đường thẳng:
+      z = a + b*y
+  */
+  float a = (x0 * x0 + y0 * y0 + z0 * z0 + DELTA_RF * DELTA_RF - DELTA_RE * DELTA_RE - y1 * y1) / (2.0f * z0);
+  float b = (y1 - y0) / z0;
+
+  /*
+    Điều kiện tồn tại nghiệm hình học.
+    Nếu d < 0 thì điểm (x0,y0,z0) nằm ngoài vùng làm việc của nhánh đó.
+  */
+  float d = -(a + b * y1) * (a + b * y1) + DELTA_RF * (b * b * DELTA_RF + DELTA_RF);
+  if (d < 0.0f) {
+    return false;
+  }
+
+  /*
+    Chọn nghiệm "outer point" giống source gốc.
+  */
+  float yj = (y1 - a * b - sqrt(d)) / (b * b + 1.0f);
+  float zj = a + b * yj;
+
+  /*
+    Tính góc theta.
+    Có thêm hiệu chỉnh 180 độ để đúng góc phần tư.
+  */
+  theta_deg = radToDeg(atan(-zj / (y1 - yj))) + ((yj > y1) ? 180.0f : 0.0f);
+
+  return true;
+}
+
+
+/* ============================================================
+   11) INVERSE KINEMATICS (IK)
+   ------------------------------------------------------------
+   Input:
+     x, y, z (mm)
+
+   Output:
+     theta1, theta2, theta3 (độ)
+
+   Ý tưởng:
+   - Tính theta1 trực tiếp trong mặt phẳng YZ
+   - Quay hệ tọa độ +120 độ để tính theta2
+   - Quay hệ tọa độ -120 độ để tính theta3
+   ============================================================ */
+DeltaIKResult delta_calcInverse(float x0, float y0, float z0) {
+  DeltaIKResult result;
+  result.ok = false;
+  result.theta1 = 0.0f;
+  result.theta2 = 0.0f;
+  result.theta3 = 0.0f;
+
+  float theta1, theta2, theta3;
+
+  // Nhánh 1
+  if (!delta_calcAngleYZ(x0, y0, z0, theta1)) {
+    return result;
+  }
+
+  // Nhánh 2: quay tọa độ +120 độ
+  if (!delta_calcAngleYZ(x0 * COS120 + y0 * SIN120,
+                         y0 * COS120 - x0 * SIN120,
+                         z0,
+                         theta2)) {
+    return result;
+  }
+
+  // Nhánh 3: quay tọa độ -120 độ
+  if (!delta_calcAngleYZ(x0 * COS120 - y0 * SIN120,
+                         y0 * COS120 + x0 * SIN120,
+                         z0,
+                         theta3)) {
+    return result;
+  }
+
+  result.ok = true;
+  result.theta1 = theta1;
+  result.theta2 = theta2;
+  result.theta3 = theta3;
+  return result;
+}
+
+
+/* ============================================================
+   12) ĐỔI GÓC TÍNH TOÁN SANG GÓC MOTOR THỰC
+   ------------------------------------------------------------
+   Dùng khi:
+   - zero cơ khí không trùng với source
+   - chiều quay motor ngược
+   ============================================================ */
+float convertCalcAngleToMotorAngle(float theta_calc_deg, int dirSign, float offset_deg) {
+  return dirSign * theta_calc_deg + offset_deg;
+}
+
+
+/* ============================================================
+   13) ĐỔI GÓC SANG SỐ STEP
+   ------------------------------------------------------------
+   Công thức:
+      steps = angle_deg * stepsPerRev / 360
+   ============================================================ */
+long angleDegToSteps(float angle_deg) {
+  return lroundf(angle_deg * STEPS_PER_REV / 360.0f);
+}
+
+
+/* ============================================================
+   14) XUẤT 3 GÓC ROBOT THÀNH 3 GIÁ TRỊ STEP
+   ------------------------------------------------------------
+   Đây là bước nối giữa động học và điều khiển động cơ.
+   ============================================================ */
+void xyzToMotorSteps(float x, float y, float z, long &s1, long &s2, long &s3, bool &ok) {
+  ok = false;
+
+  DeltaIKResult ik = delta_calcInverse(x, y, z);
+  if (!ik.ok) {
+    return;
+  }
+
+  float m1_deg = convertCalcAngleToMotorAngle(ik.theta1, DIR_SIGN_T1, OFFSET_T1_DEG);
+  float m2_deg = convertCalcAngleToMotorAngle(ik.theta2, DIR_SIGN_T2, OFFSET_T2_DEG);
+  float m3_deg = convertCalcAngleToMotorAngle(ik.theta3, DIR_SIGN_T3, OFFSET_T3_DEG);
+
+  s1 = angleDegToSteps(m1_deg);
+  s2 = angleDegToSteps(m2_deg);
+  s3 = angleDegToSteps(m3_deg);
+
+  ok = true;
+}
+
+
+/* ============================================================
+   15) PHÁT XUNG STEP CƠ BẢN
+   ------------------------------------------------------------
+   Đây chỉ là ví dụ rất đơn giản.
+   Chưa tối ưu tốc độ, chưa có profile gia tốc.
+   ============================================================ */
+void pulseStepPin(int pin) {
+  digitalWrite(pin, HIGH);
+  delayMicroseconds(5);
+  digitalWrite(pin, LOW);
+  delayMicroseconds(5);
+}
+
+
+/* ============================================================
+   16) DI CHUYỂN STEP TƯƠNG ĐỐI RẤT CƠ BẢN CHO 1 TRỤC
+   ------------------------------------------------------------
+   Chỉ để bạn hiểu logic. Khi chạy thật nên dùng bộ lập lịch step tốt hơn.
+   ============================================================ */
+void moveAxisToTarget(long currentStep, long targetStep, int stepPin, int dirPin) {
+  long delta = targetStep - currentStep;
+
+  if (delta >= 0) {
+    digitalWrite(dirPin, HIGH);
+  } else {
+    digitalWrite(dirPin, LOW);
+    delta = -delta;
+  }
+
+  for (long i = 0; i < delta; i++) {
+    pulseStepPin(stepPin);
+  }
+}
+
+
+/* ============================================================
+   17) BIẾN VỊ TRÍ STEP HIỆN TẠI
+   ------------------------------------------------------------
+   Trong thực tế:
+   - nên có homing
+   - nên có công tắc hành trình
+   - nên có đồng bộ 3 trục
+   Ở đây chỉ là tối giản để bạn hiểu luồng.
+   ============================================================ */
+long currentStep1 = 0;
+long currentStep2 = 0;
+long currentStep3 = 0;
+
+
+/* ============================================================
+   18) MOVE TO XYZ - BẢN TỐI GIẢN
+   ------------------------------------------------------------
+   Luồng:
+     XYZ -> IK -> motor angles -> steps -> pulse
+   ============================================================ */
+bool moveToXYZ(float x, float y, float z) {
+  long s1, s2, s3;
+  bool ok;
+
+  xyzToMotorSteps(x, y, z, s1, s2, s3, ok);
+  if (!ok) {
+    Serial.println("[ERROR] Target point is outside workspace.");
+    return false;
+  }
+
+  Serial.println("====================================");
+  Serial.print("Target XYZ = ");
+  Serial.print(x); Serial.print(", ");
+  Serial.print(y); Serial.print(", ");
+  Serial.println(z);
+
+  DeltaIKResult ik = delta_calcInverse(x, y, z);
+  Serial.print("Theta calc = ");
+  Serial.print(ik.theta1); Serial.print(", ");
+  Serial.print(ik.theta2); Serial.print(", ");
+  Serial.print(ik.theta3); Serial.println(" deg");
+
+  Serial.print("Target steps = ");
+  Serial.print(s1); Serial.print(", ");
+  Serial.print(s2); Serial.print(", ");
+  Serial.print(s3); Serial.println();
+
+  /*
+    Chú ý:
+    Đoạn dưới đang chạy từng trục nối tiếp.
+    Robot thật nên chạy nội suy đồng bộ 3 trục, không nên chạy tuần tự như vậy.
+  */
+  moveAxisToTarget(currentStep1, s1, STEP_PIN_1, DIR_PIN_1);
+  moveAxisToTarget(currentStep2, s2, STEP_PIN_2, DIR_PIN_2);
+  moveAxisToTarget(currentStep3, s3, STEP_PIN_3, DIR_PIN_3);
+
+  currentStep1 = s1;
+  currentStep2 = s2;
+  currentStep3 = s3;
+
+  return true;
+}
+
+
+/* ============================================================
+   19) HÀM TEST FK/IK
+   ------------------------------------------------------------
+   Dùng để kiểm chứng công thức:
+   - cho 1 bộ góc -> FK -> ra XYZ
+   - lấy XYZ đó -> IK -> xem có ra gần bộ góc ban đầu không
+   ============================================================ */
+void testFKIKConsistency(float t1, float t2, float t3) {
+  Serial.println("========== FK/IK CONSISTENCY TEST ==========");
+
+  DeltaFKResult fk = delta_calcForward(t1, t2, t3);
+  if (!fk.ok) {
+    Serial.println("FK failed.");
+    return;
+  }
+
+  Serial.print("Input theta = ");
+  Serial.print(t1); Serial.print(", ");
+  Serial.print(t2); Serial.print(", ");
+  Serial.print(t3); Serial.println(" deg");
+
+  Serial.print("FK -> XYZ = ");
+  Serial.print(fk.x); Serial.print(", ");
+  Serial.print(fk.y); Serial.print(", ");
+  Serial.print(fk.z); Serial.println(" mm");
+
+  DeltaIKResult ik = delta_calcInverse(fk.x, fk.y, fk.z);
+  if (!ik.ok) {
+    Serial.println("IK failed.");
+    return;
+  }
+
+  Serial.print("IK(FK(theta)) = ");
+  Serial.print(ik.theta1); Serial.print(", ");
+  Serial.print(ik.theta2); Serial.print(", ");
+  Serial.print(ik.theta3); Serial.println(" deg");
+}
+
+
+/* ============================================================
+   20) SETUP
+   ------------------------------------------------------------
+   Khởi tạo Serial và pin IO
+   ============================================================ */
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  pinMode(STEP_PIN_1, OUTPUT);
+  pinMode(DIR_PIN_1, OUTPUT);
+
+  pinMode(STEP_PIN_2, OUTPUT);
+  pinMode(DIR_PIN_2, OUTPUT);
+
+  pinMode(STEP_PIN_3, OUTPUT);
+  pinMode(DIR_PIN_3, OUTPUT);
+
+  pinMode(EN_PIN, OUTPUT);
+
+  // giả sử enable active LOW
+  digitalWrite(EN_PIN, LOW);
+
+  Serial.println("\nDELTA ROBOT KINEMATICS - ESP32 / MKS DLC32 V2.1");
+  Serial.println("Start tests...");
+
+  // Test khớp FK/IK
+  testFKIKConsistency(5.0f, 10.0f, 15.0f);
+
+  // Test đi một vài điểm
+  moveToXYZ(0.0f, 0.0f, -250.0f);
+  delay(1000);
+
+  moveToXYZ(20.0f, 0.0f, -250.0f);
+  delay(1000);
+
+  moveToXYZ(0.0f, 20.0f, -250.0f);
+  delay(1000);
+}
+
+
+/* ============================================================
+   21) LOOP
+   ------------------------------------------------------------
+   Hiện để trống.
+   Bạn có thể sau này:
+   - đọc lệnh từ Serial
+   - đọc G-code
+   - thêm nội suy đường thẳng
+   ============================================================ */
+void loop() {
+  // Empty for now
+}
