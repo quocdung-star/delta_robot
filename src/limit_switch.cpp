@@ -8,6 +8,10 @@ void limit_switch_init() {
     pinMode(LIMIT_Z, INPUT);
 }
 
+void limit_switch_update() {
+    // Reserved for future debounce/filter logic.
+}
+
 bool limit_switch_is_triggered(int pin) {
     return digitalRead(pin) == ENDSTOP_TRIGGERED;
 }

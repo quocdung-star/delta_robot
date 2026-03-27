@@ -7,7 +7,6 @@
 #include "emergency_stop.h"
 #include "homing.h"
 #include "limit_switch.h"
-#include "limit_switch_monitor.h"
 #include "speed_control.h"
 #include "stepper.h"
 
@@ -112,7 +111,7 @@ static bool parse_pulses(const String &command, long &pulses) {
     return true;
 }
 
-static bool move_axis_from_pulses(const char *axisName, Axis &axis, long pulses, LimitSwitchReadFn homeSwitchTriggered) {
+static void print_move_request(const char *axisName, long pulses) {
     const bool dirHigh = pulses >= 0;
     const long steps = labs(pulses);
 
@@ -123,18 +122,6 @@ static bool move_axis_from_pulses(const char *axisName, Axis &axis, long pulses,
     Serial.print(dirHigh ? "HIGH" : "LOW");
     Serial.print(", steps=");
     Serial.println(steps);
-
-    if (steps == 0) {
-        return true;
-    }
-
-    if (!dirHigh && homeSwitchTriggered != nullptr && homeSwitchTriggered()) {
-        Serial.print(axisName);
-        Serial.println(": move blocked because home limit is already active.");
-        return false;
-    }
-
-    return stepper_move_axis(axis, dirHigh, steps, homeSwitchTriggered);
 }
 
 static void handle_pulse_command(const String &command) {
@@ -169,11 +156,17 @@ static void handle_pulse_command(const String &command) {
             break;
     }
 
-    const bool xOk = move_axis_from_pulses("X", axisX, pendingXPulses, limit_x_triggered);
-    const bool yOk = xOk ? move_axis_from_pulses("Y", axisY, pendingYPulses, limit_y_triggered) : false;
-    const bool zOk = yOk ? move_axis_from_pulses("Z", axisZ, pendingZPulses, limit_z_triggered) : false;
+    print_move_request("X", pendingXPulses);
+    print_move_request("Y", pendingYPulses);
+    print_move_request("Z", pendingZPulses);
 
-    if (xOk && yOk && zOk) {
+    const bool moveOk = stepper_move_axes(
+        pendingXPulses >= 0, labs(pendingXPulses), limit_x_triggered,
+        pendingYPulses >= 0, labs(pendingYPulses), limit_y_triggered,
+        pendingZPulses >= 0, labs(pendingZPulses), limit_z_triggered
+    );
+
+    if (moveOk) {
         Serial.println("MOVE_DONE");
     } else {
         Serial.println("MOVE_ABORTED");
@@ -237,7 +230,7 @@ void setup() {
     pinMode(CLOCK_PIN, OUTPUT);
     pinMode(LATCH_PIN, OUTPUT);
 
-    limit_switch_monitor_init();
+    limit_switch_init();
     emergency_stop_init();
     axis_init();
     stepper_init();
@@ -248,7 +241,7 @@ void setup() {
 }
 
 void loop() {
-    limit_switch_monitor_update();
+    limit_switch_update();
 
     while (Serial.available()) {
         const char c = (char) Serial.read();
